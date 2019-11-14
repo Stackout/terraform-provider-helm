@@ -1,27 +1,34 @@
 package helm
 
 import (
-	"errors"
+	"encoding/json"
 	"fmt"
 	"log"
 	"net/url"
 	"os"
-	"path/filepath"
 	"strings"
 	"time"
 
-	"google.golang.org/grpc"
-
-	"github.com/ghodss/yaml"
 	"github.com/hashicorp/terraform-plugin-sdk/helper/schema"
-	"k8s.io/helm/pkg/chartutil"
-	"k8s.io/helm/pkg/downloader"
-	"k8s.io/helm/pkg/getter"
-	"k8s.io/helm/pkg/helm"
-	"k8s.io/helm/pkg/proto/hapi/chart"
-	"k8s.io/helm/pkg/proto/hapi/release"
-	"k8s.io/helm/pkg/repo"
-	"k8s.io/helm/pkg/strvals"
+	"github.com/pkg/errors"
+	"gopkg.in/yaml.v1"
+	"helm.sh/helm/v3/pkg/action"
+	"helm.sh/helm/v3/pkg/chart"
+	"helm.sh/helm/v3/pkg/chart/loader"
+	"helm.sh/helm/v3/pkg/downloader"
+	"helm.sh/helm/v3/pkg/getter"
+	"helm.sh/helm/v3/pkg/release"
+	"helm.sh/helm/v3/pkg/strvals"
+	// "k8s.io/helm/pkg/helm"
+	// "k8s.io/helm/pkg/strvals"
+	// "k8s.io/helm/pkg/chartutil"
+	// "k8s.io/helm/pkg/downloader"
+	// "k8s.io/helm/pkg/getter"
+	// "k8s.io/helm/pkg/helm"
+	// "k8s.io/helm/pkg/proto/hapi/chart"
+	// "k8s.io/helm/pkg/proto/hapi/release"
+	// "k8s.io/helm/pkg/repo"
+	// "k8s.io/helm/pkg/strvals"
 )
 
 // ErrReleaseNotFound is the error when a Helm release is not found
@@ -45,7 +52,22 @@ func resourceRelease() *schema.Resource {
 			"repository": {
 				Type:        schema.TypeString,
 				Optional:    true,
-				Description: "Repository where to locate the requested chart. If is an URL the chart is installed without installing the repository.",
+				Description: "Repository where to locate the requested chart. If is a URL the chart is installed without installing the repository.",
+			},
+			"repository_key_file": {
+				Type:        schema.TypeString,
+				Optional:    true,
+				Description: "The repositories cert key file",
+			},
+			"repository_cert_file": {
+				Type:        schema.TypeString,
+				Optional:    true,
+				Description: "The repositories cert file",
+			},
+			"repository_ca_file": {
+				Type:        schema.TypeString,
+				Optional:    true,
+				Description: "The Repositories CA File",
 			},
 			"chart": {
 				Type:        schema.TypeString,
@@ -163,7 +185,13 @@ func resourceRelease() *schema.Resource {
 			"reuse_values": {
 				Type:        schema.TypeBool,
 				Optional:    true,
-				Description: "Reuse values when upgrading the release.",
+				Description: "When upgrading, reuse the last release's values and merge in any overrides. If 'reset_values' is specified, this is ignored",
+				Default:     false,
+			},
+			"reset_values": {
+				Type:        schema.TypeBool,
+				Optional:    true,
+				Description: "When upgrading, reset the values to the ones built into the chart",
 				Default:     false,
 			},
 			"force_update": {
@@ -172,17 +200,41 @@ func resourceRelease() *schema.Resource {
 				Default:     false,
 				Description: "Force resource update through delete/recreate if needed.",
 			},
-			"reuse": {
-				Type:        schema.TypeBool,
-				Optional:    true,
-				Default:     false,
-				Description: "Instruct Tiller to re-use an existing name.",
-			},
 			"recreate_pods": {
 				Type:        schema.TypeBool,
 				Optional:    true,
 				Default:     false,
 				Description: "Perform pods restart during upgrade/rollback",
+			},
+			"cleanup_on_fail": {
+				Type:        schema.TypeBool,
+				Optional:    true,
+				Default:     false,
+				Description: "Allow deletion of new resources created in this upgrade when upgrade fails",
+			},
+			"max_history": {
+				Type:        schema.TypeInt,
+				Optional:    true,
+				Default:     0,
+				Description: "Limit the maximum number of revisions saved per release. Use 0 for no limit",
+			},
+			"atomic": {
+				Type:        schema.TypeBool,
+				Optional:    true,
+				Default:     false,
+				Description: "If set, installation process purges chart on fail. The wait flag will be set automatically if atomic is used",
+			},
+			"skip_crds": {
+				Type:        schema.TypeBool,
+				Optional:    true,
+				Default:     false,
+				Description: "If set, no CRDs will be installed. By default, CRDs are installed if not already present",
+			},
+			"render_subchart_notes": {
+				Type:        schema.TypeBool,
+				Optional:    true,
+				Default:     true,
+				Description: "If set, render subchart notes along with the parent",
 			},
 			"wait": {
 				Type:        schema.TypeBool,
@@ -194,6 +246,12 @@ func resourceRelease() *schema.Resource {
 				Type:        schema.TypeString,
 				Computed:    true,
 				Description: "Status of the release.",
+			},
+			"dependency_update": {
+				Type:        schema.TypeBool,
+				Optional:    true,
+				Default:     false,
+				Description: "run helm dependency update before installing the chart",
 			},
 			"metadata": {
 				Type:        schema.TypeList,
@@ -238,70 +296,214 @@ func resourceRelease() *schema.Resource {
 	}
 }
 
-// prepareTillerForNewRelease determines the current status of the given release and
-// waits for Tiller to be ready to create/update a new release.
-// If the release is FAILED then we delete and re-create it.
-func prepareTillerForNewRelease(d *schema.ResourceData, c helm.Interface, name string) error {
-	for {
-		r, err := getRelease(c, name)
-		switch err {
-		case ErrReleaseNotFound:
-			// we don't have a release. create it.
-			return nil
-		case nil:
-			// we have a release. check its status.
-			break
-		default:
-			// err is not nil. we can't get a release. abort
-			return err
-		}
+func resourceReleaseRead(d *schema.ResourceData, meta interface{}) error {
+	m := meta.(*Meta)
+	n := d.Get("namespace").(string)
 
-		switch r.Info.Status.GetCode() {
-		case release.Status_DEPLOYED:
-			return setIDAndMetadataFromRelease(d, r)
-		case release.Status_FAILED:
-			// delete and recreate it
-			debug("release %s status is FAILED deleting it", name)
+	c, err := m.GetHelmConfiguration(n)
+	if err != nil {
+		return err
+	}
 
-			if err := deleteRelease(c,
-				name,
-				d.Get("disable_webhooks").(bool),
-				int64(d.Get("timeout").(int))); err != nil {
-				debug("could not delete release %s: %v", name, err)
+	name := d.Get("name").(string)
+
+	r, err := getRelease(c, name)
+	if err != nil {
+		return err
+	}
+
+	return setIDAndMetadataFromRelease(d, r)
+}
+
+func resourceReleaseCreate(d *schema.ResourceData, meta interface{}) error {
+	m := meta.(*Meta)
+	n := d.Get("namespace").(string)
+
+	debug("Getting Config")
+
+	actionConfig, err := m.GetHelmConfiguration(n)
+	if err != nil {
+		return err
+	}
+
+	cpo, chartName, err := chartPathOptions(d, m)
+	if err != nil {
+		return err
+	}
+	debug("Getting chart")
+	//name := d.Get("name").(string)
+
+	chart, path, err := getChart(d, m, chartName, cpo)
+	if err != nil {
+		return err
+	}
+
+	debug("Got Chart from Helm")
+
+	p := getter.All(m.Settings)
+
+	values, err := getValues(d)
+	if err != nil {
+		return err
+	}
+
+	//
+	validInstallableChart, err := isChartInstallable(chart)
+	if !validInstallableChart {
+		return err
+	}
+
+	updateDependency := d.Get("dependency_update").(bool)
+
+	if req := chart.Metadata.Dependencies; req != nil {
+		// If CheckDependencies returns an error, we have unfulfilled dependencies.
+		// As of Helm 2.4.0, this is treated as a stopping condition:
+		// https://github.com/helm/helm/issues/2209
+		if err := action.CheckDependencies(chart, req); err != nil {
+			if updateDependency {
+				man := &downloader.Manager{
+					Out:              os.Stdout,
+					ChartPath:        path,
+					Keyring:          d.Get("keyring").(string),
+					SkipUpdate:       false,
+					Getters:          p,
+					RepositoryConfig: m.Settings.RepositoryConfig,
+					RepositoryCache:  m.Settings.RepositoryCache,
+				}
+				if err := man.Update(); err != nil {
+					return err
+				}
+			} else {
 				return err
 			}
-
-			continue
-		case release.Status_DELETED:
-			// re-install it
-			return nil
-		case release.Status_UNKNOWN:
-			// re-install it
-			return nil
-		case release.Status_DELETING,
-			release.Status_PENDING_INSTALL,
-			release.Status_PENDING_ROLLBACK,
-			release.Status_PENDING_UPGRADE:
-			// wait for update?
-			debug("release %s waiting for status change %s", name, r.Info.Status.Code)
-			time.Sleep(1 * time.Second)
-			continue
-		default:
-			return errors.New("unknown release status")
 		}
 	}
+
+	client := action.NewInstall(actionConfig)
+	client.ChartPathOptions = *cpo
+	client.ClientOnly = false
+	client.DryRun = false
+	client.DisableHooks = d.Get("disable_webhooks").(bool)
+	client.Replace = true
+	client.Wait = d.Get("wait").(bool)
+	client.Devel = d.Get("devel").(bool)
+	client.DependencyUpdate = updateDependency
+	client.Timeout = time.Duration(d.Get("timeout").(int)) * time.Second
+	client.Namespace = d.Get("namespace").(string)
+	client.ReleaseName = d.Get("name").(string)
+	client.GenerateName = false
+	client.NameTemplate = ""
+	client.OutputDir = ""
+	client.Atomic = d.Get("atomic").(bool)
+	client.SkipCRDs = d.Get("skip_crds").(bool)
+	client.SubNotes = d.Get("render_subchart_notes").(bool)
+
+	debug("Installing Chart")
+
+	release, err := client.Run(chart, values)
+
+	if err != nil {
+		return err
+	}
+
+	return setIDAndMetadataFromRelease(d, release)
+}
+
+func resourceReleaseUpdate(d *schema.ResourceData, meta interface{}) error {
+	m := meta.(*Meta)
+	n := d.Get("namespace").(string)
+	actionConfig, err := m.GetHelmConfiguration(n)
+	if err != nil {
+		return err
+	}
+
+	cpo, chartName, err := chartPathOptions(d, m)
+	if err != nil {
+		return err
+	}
+
+	chart, _, err := getChart(d, m, chartName, cpo)
+	if err != nil {
+		return err
+	}
+
+	if req := chart.Metadata.Dependencies; req != nil {
+		if err := action.CheckDependencies(chart, req); err != nil {
+			return err
+		}
+	}
+
+	client := action.NewUpgrade(actionConfig)
+	client.ChartPathOptions = *cpo
+	client.Devel = d.Get("devel").(bool)
+	client.Namespace = d.Get("namespace").(string)
+	client.Timeout = time.Duration(d.Get("timeout").(int)) * time.Second
+	client.Wait = d.Get("wait").(bool)
+	client.DryRun = false
+	client.DisableHooks = d.Get("disable_webhooks").(bool)
+	client.Atomic = d.Get("atomic").(bool)
+	client.SubNotes = d.Get("render_subchart_notes").(bool)
+	client.Force = d.Get("force_update").(bool)
+	client.ResetValues = d.Get("reset_values").(bool)
+	client.ReuseValues = d.Get("reuse_values").(bool)
+	client.Recreate = d.Get("recreate_pods").(bool)
+	client.MaxHistory = d.Get("max_history").(int)
+	client.CleanupOnFail = d.Get("cleanup_on_fail").(bool)
+
+	values, err := getValues(d)
+	if err != nil {
+		return err
+	}
+
+	name := d.Get("name").(string)
+	release, err := client.Run(name, chart, values)
+	if err != nil {
+		return err
+	}
+
+	return setIDAndMetadataFromRelease(d, release)
+}
+
+func resourceReleaseDelete(d *schema.ResourceData, meta interface{}) error {
+	m := meta.(*Meta)
+	n := d.Get("namespace").(string)
+	actionConfig, err := m.GetHelmConfiguration(n)
+	if err != nil {
+		return err
+	}
+
+	name := d.Get("name").(string)
+
+	res, err := action.NewUninstall(actionConfig).Run(name)
+
+	if err != nil {
+		return err
+	}
+
+	if res.Info != "" {
+		return error(fmt.Errorf(res.Info))
+	}
+
+	d.SetId("")
+	return nil
 }
 
 func resourceDiff(d *schema.ResourceDiff, meta interface{}) error {
+	m := meta.(*Meta)
 
 	// Always set desired state to DEPLOYED
-	err := d.SetNew("status", release.Status_DEPLOYED.String())
+	err := d.SetNew("status", release.StatusDeployed.String())
+	if err != nil {
+		return err
+	}
+
+	cpo, chartName, err := chartPathOptions(d, m)
 	if err != nil {
 		return err
 	}
 
 	// Get Chart metadata, if we fail - we're done
-	c, _, err := getChart(d, meta.(*Meta))
+	c, _, err := getChart(d, meta.(*Meta), chartName, cpo)
 	if err != nil {
 		return nil
 	}
@@ -315,70 +517,27 @@ func resourceDiff(d *schema.ResourceDiff, meta interface{}) error {
 
 }
 
-func resourceReleaseCreate(d *schema.ResourceData, meta interface{}) error {
-	m := meta.(*Meta)
-	c, err := m.GetHelmClient()
-	if err != nil {
-		return err
-	}
-	name := d.Get("name").(string)
-
-	if err = prepareTillerForNewRelease(d, c, name); err != nil {
-		return err
-	}
-
-	chart, _, err := getChart(d, m)
-	if err != nil {
-		return err
-	}
-
-	values, err := getValues(d)
-	if err != nil {
-		return err
-	}
-
-	opts := []helm.InstallOption{
-		helm.ReleaseName(d.Get("name").(string)),
-		helm.InstallReuseName(d.Get("reuse").(bool)),
-		helm.ValueOverrides(values),
-		helm.InstallDisableHooks(d.Get("disable_webhooks").(bool)),
-		helm.InstallTimeout(int64(d.Get("timeout").(int))),
-		helm.InstallWait(d.Get("wait").(bool)),
-	}
-
-	ns := d.Get("namespace").(string)
-	res, err := c.InstallReleaseFromChart(chart, ns, opts...)
-	if err != nil {
-		return err
-	}
-
-	return setIDAndMetadataFromRelease(d, res.Release)
-}
-
-func resourceReleaseRead(d *schema.ResourceData, meta interface{}) error {
-	m := meta.(*Meta)
-	c, err := m.GetHelmClient()
-	if err != nil {
-		return err
-	}
-
-	name := d.Get("name").(string)
-
-	r, err := getRelease(c, name)
-	if err != nil {
-		return err
-	}
-
-	//  d.Set("values_source_detected_md5", d.Get("values_sources_md5"))
-
-	return setIDAndMetadataFromRelease(d, r)
-}
-
 func setIDAndMetadataFromRelease(d *schema.ResourceData, r *release.Release) error {
 	d.SetId(r.Name)
-	d.Set("version", r.Chart.Metadata.Version)
-	d.Set("namespace", r.Namespace)
-	d.Set("status", r.Info.Status.Code.String())
+	if err := d.Set("version", r.Chart.Metadata.Version); err != nil {
+		return err
+	}
+
+	if err := d.Set("namespace", r.Namespace); err != nil {
+		return err
+	}
+
+	if err := d.Set("status", r.Info.Status.String()); err != nil {
+		return err
+	}
+
+	c, err := json.Marshal(r.Config)
+
+	if err != nil {
+		return err
+	}
+
+	json := string(c)
 
 	return d.Set("metadata", []map[string]interface{}{{
 		"name":      r.Name,
@@ -386,73 +545,22 @@ func setIDAndMetadataFromRelease(d *schema.ResourceData, r *release.Release) err
 		"namespace": r.Namespace,
 		"chart":     r.Chart.Metadata.Name,
 		"version":   r.Chart.Metadata.Version,
-		"values":    r.Config.Raw,
+		"values":    json,
 	}})
-}
-
-func resourceReleaseUpdate(d *schema.ResourceData, meta interface{}) error {
-	m := meta.(*Meta)
-
-	values, err := getValues(d)
-	if err != nil {
-		return err
-	}
-
-	_, path, err := getChart(d, m)
-	if err != nil {
-		return err
-	}
-
-	opts := []helm.UpdateOption{
-		helm.UpdateValueOverrides(values),
-		helm.UpgradeRecreate(d.Get("recreate_pods").(bool)),
-		helm.UpgradeForce(d.Get("force_update").(bool)),
-		helm.UpgradeDisableHooks(d.Get("disable_webhooks").(bool)),
-		helm.UpgradeTimeout(int64(d.Get("timeout").(int))),
-		helm.ReuseValues(d.Get("reuse_values").(bool)),
-		helm.UpgradeWait(d.Get("wait").(bool)),
-	}
-
-	c, err := m.GetHelmClient()
-	if err != nil {
-		return err
-	}
-
-	name := d.Get("name").(string)
-	res, err := c.UpdateRelease(name, path, opts...)
-	if err != nil {
-		return err
-	}
-
-	return setIDAndMetadataFromRelease(d, res.Release)
-}
-
-func resourceReleaseDelete(d *schema.ResourceData, meta interface{}) error {
-	m := meta.(*Meta)
-	c, err := m.GetHelmClient()
-	if err != nil {
-		return err
-	}
-
-	name := d.Get("name").(string)
-	disableWebhooks := d.Get("disable_webhooks").(bool)
-	timeout := int64(d.Get("timeout").(int))
-
-	if err := deleteRelease(c, name, disableWebhooks, timeout); err != nil {
-		return err
-	}
-	d.SetId("")
-	return nil
 }
 
 func resourceReleaseExists(d *schema.ResourceData, meta interface{}) (bool, error) {
 	m := meta.(*Meta)
-	c, err := m.GetHelmClient()
+	n := d.Get("namespace").(string)
+
+	c, err := m.GetHelmConfiguration(n)
 	if err != nil {
 		return false, err
 	}
+
 	name := d.Get("name").(string)
 	_, err = getRelease(c, name)
+
 	if err == nil {
 		return true, nil
 	}
@@ -464,63 +572,41 @@ func resourceReleaseExists(d *schema.ResourceData, meta interface{}) (bool, erro
 	return false, err
 }
 
-func deleteRelease(c helm.Interface, name string, disableWebhooks bool, timeout int64) error {
-
-	opts := []helm.DeleteOption{
-		helm.DeleteDisableHooks(disableWebhooks),
-		helm.DeletePurge(true),
-		helm.DeleteTimeout(timeout),
-	}
-
-	if _, err := c.DeleteRelease(name, opts...); err != nil {
-		return err
-	}
-
-	return nil
-}
-
 type resourceGetter interface {
 	Get(string) interface{}
 }
 
-func getChart(d resourceGetter, m *Meta) (c *chart.Chart, path string, err error) {
-	version := d.Get("version").(string)
+func getVersion(d resourceGetter, m *Meta) (version string) {
+	version = d.Get("version").(string)
 
 	if version == "" && d.Get("devel").(bool) {
 		debug("setting version to >0.0.0-0")
 		version = ">0.0.0-0"
-	}
-
-	l, err := newChartLocator(m,
-		d.Get("repository").(string),
-		d.Get("chart").(string),
-		version,
-		d.Get("verify").(bool),
-		d.Get("keyring").(string),
-	)
-	if err != nil {
-		return
-	}
-
-	path, err = l.Locate()
-	if err != nil {
-		return
-	}
-
-	c, err = chartutil.Load(path)
-	if err != nil {
-		return
-	}
-
-	if req, err := chartutil.LoadRequirements(c); err == nil {
-		if err := checkDependencies(c, req); err != nil {
-			return nil, "", err
-		}
-	} else if err != chartutil.ErrRequirementsNotFound {
-		return nil, "", fmt.Errorf("cannot load requirements: %v", err)
+	} else {
+		version = strings.TrimSpace(version)
 	}
 
 	return
+}
+
+func getChart(d resourceGetter, m *Meta, name string, cpo *action.ChartPathOptions) (c *chart.Chart, path string, err error) {
+	//Load function blows up if accessed concurrently
+	m.Lock()
+	defer m.Unlock()
+
+	n, err := cpo.LocateChart(name, m.Settings)
+
+	if err != nil {
+		return nil, "", err
+	}
+
+	c, err = loader.Load(n)
+
+	if err != nil {
+		return nil, "", err
+	}
+
+	return c, path, nil
 }
 
 // Merges source and destination map, preferring values from the source map
@@ -556,7 +642,7 @@ func mergeValues(dest map[string]interface{}, src map[string]interface{}) map[st
 	return dest
 }
 
-func getValues(d *schema.ResourceData) ([]byte, error) {
+func getValues(d *schema.ResourceData) (map[string]interface{}, error) {
 	base := map[string]interface{}{}
 
 	for _, raw := range d.Get("values").([]interface{}) {
@@ -616,22 +702,16 @@ func getValues(d *schema.ResourceData) ([]byte, error) {
 		log.Printf("---[ values.yaml ]-----------------------------------\n%s\n", yamlString)
 	}
 
-	return yaml, err
+	return base, err
 }
 
-var all = []release.Status_Code{
-	release.Status_UNKNOWN,
-	release.Status_DEPLOYED,
-	release.Status_DELETED,
-	release.Status_DELETING,
-	release.Status_FAILED,
-}
+func getRelease(cfg *action.Configuration, name string) (*release.Release, error) {
 
-func getRelease(client helm.Interface, name string) (*release.Release, error) {
-	res, err := client.ReleaseContent(name)
+	get := action.NewGet(cfg)
+	res, err := get.Run(name)
+
 	if err != nil {
-		msg := grpc.ErrorDesc(err)
-		if strings.Contains(msg, "not found") {
+		if strings.Contains(err.Error(), "release: not found") {
 			return nil, ErrReleaseNotFound
 		}
 
@@ -640,42 +720,9 @@ func getRelease(client helm.Interface, name string) (*release.Release, error) {
 		return nil, err
 	}
 
-	debug("got release %v", res.Release)
+	debug("got release %v", res)
 
-	return res.Release, nil
-}
-
-type chartLocator struct {
-	meta *Meta
-
-	name          string
-	version       string
-	repositoryURL string
-	verify        bool
-	keyring       string
-}
-
-func newChartLocator(meta *Meta,
-	repository, name, version string,
-	verify bool, keyring string,
-) (*chartLocator, error) {
-	name = strings.TrimSpace(name)
-	version = strings.TrimSpace(version)
-
-	repositoryURL, name, err := resolveChartName(repository, name)
-	if err != nil {
-		return nil, err
-	}
-
-	return &chartLocator{
-		meta:          meta,
-		name:          name,
-		version:       version,
-		repositoryURL: repositoryURL,
-		verify:        verify,
-		keyring:       keyring,
-	}, nil
-
+	return res, nil
 }
 
 func resolveChartName(repository, name string) (string, string, error) {
@@ -691,133 +738,34 @@ func resolveChartName(repository, name string) (string, string, error) {
 	return "", name, nil
 }
 
-func (l *chartLocator) Locate() (string, error) {
-	pipeline := []func() (string, error){
-		l.locateChartPathInLocal,
-		l.locateChartPathInLocalRepository,
-		l.locateChartPathInRepository,
+func isChartInstallable(ch *chart.Chart) (bool, error) {
+	switch ch.Metadata.Type {
+	case "", "application":
+		return true, nil
 	}
-
-	for _, f := range pipeline {
-		path, err := f()
-		if err != nil {
-			return "", err
-		}
-
-		if path == "" {
-			continue
-		}
-
-		return path, err
-	}
-
-	return "", fmt.Errorf("chart %q not found", l.name)
+	return false, errors.Errorf("%s charts are not installable", ch.Metadata.Type)
 }
 
-func (l *chartLocator) locateChartPathInLocal() (string, error) {
-	fi, err := os.Stat(l.name)
+func chartPathOptions(d resourceGetter, m *Meta) (*action.ChartPathOptions, string, error) {
+	chartName := d.Get("chart").(string)
+
+	repository := d.Get("repository").(string)
+	repositoryURL, chartName, err := resolveChartName(repository, strings.TrimSpace(chartName))
+
 	if err != nil {
-		if filepath.IsAbs(l.name) || strings.HasPrefix(l.name, ".") {
-			return "", fmt.Errorf("path %q not found", l.name)
-		}
-
-		return "", nil
+		return nil, "", err
 	}
+	version := getVersion(d, m)
 
-	abs, err := filepath.Abs(l.name)
-	if err != nil {
-		return "", err
-	}
-
-	if l.verify {
-		if fi.IsDir() {
-			return "", fmt.Errorf("cannot verify a directory")
-		}
-
-		if _, err := downloader.VerifyChart(abs, l.keyring); err != nil {
-			return "", err
-		}
-	}
-
-	return abs, nil
-}
-
-func (l *chartLocator) locateChartPathInLocalRepository() (string, error) {
-	repo := filepath.Join(l.meta.Settings.Home.Repository(), l.name)
-	if _, err := os.Stat(repo); err == nil {
-		return filepath.Abs(repo)
-	}
-
-	return "", nil
-}
-
-func (l *chartLocator) locateChartPathInRepository() (string, error) {
-	ref, err := l.retrieveChartURL(l.repositoryURL, l.name, l.version)
-	if err != nil {
-		return "", fmt.Errorf("failed to resolve %q, %s", l.name, err)
-	}
-
-	if _, err := os.Stat(l.meta.Settings.Home.Archive()); os.IsNotExist(err) {
-		if err := os.MkdirAll(l.meta.Settings.Home.Archive(), 0744); err != nil {
-			return "", fmt.Errorf("failed to create archive folder, %s", err)
-		}
-	}
-
-	return l.downloadChart(ref)
-}
-
-func (l *chartLocator) retrieveChartURL(repositoryURL, name, version string) (string, error) {
-	if repositoryURL == "" {
-		return name, nil
-	}
-
-	return repo.FindChartInRepoURL(
-		repositoryURL, name, version,
-		tlsCertFile, tlsKeyFile, tlsCaCertFile, getter.All(*l.meta.Settings),
-	)
-}
-
-func (l *chartLocator) downloadChart(ref string) (string, error) {
-	dl := downloader.ChartDownloader{
-		HelmHome: l.meta.Settings.Home,
-		Out:      os.Stdout,
-		Keyring:  l.keyring,
-		Getters:  getter.All(*l.meta.Settings),
-	}
-
-	if l.verify {
-		dl.Verify = downloader.VerifyAlways
-	}
-
-	filename, _, err := dl.DownloadTo(ref, l.version, l.meta.Settings.Home.Archive())
-	if err != nil {
-		return "", err
-	}
-
-	debug("Fetched %s to %s\n", ref, filename)
-	return filepath.Abs(filename)
-}
-
-// from helm
-func checkDependencies(ch *chart.Chart, reqs *chartutil.Requirements) error {
-	missing := []string{}
-
-	deps := ch.GetDependencies()
-	for _, r := range reqs.Dependencies {
-		found := false
-		for _, d := range deps {
-			if d.Metadata.Name == r.Name {
-				found = true
-				break
-			}
-		}
-		if !found {
-			missing = append(missing, r.Name)
-		}
-	}
-
-	if len(missing) > 0 {
-		return fmt.Errorf("found in requirements.yaml, but missing in charts/ directory: %s", strings.Join(missing, ", "))
-	}
-	return nil
+	return &action.ChartPathOptions{
+		CaFile:   d.Get("repository_ca_file").(string),
+		CertFile: d.Get("repository_cert_file").(string),
+		KeyFile:  d.Get("repository_key_file").(string),
+		Keyring:  d.Get("keyring").(string),
+		RepoURL:  repositoryURL,
+		Verify:   d.Get("verify").(bool),
+		Version:  version,
+		//Username: string,
+		//Password: string,
+	}, chartName, nil
 }
